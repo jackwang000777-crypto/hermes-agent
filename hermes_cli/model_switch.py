@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import List, NamedTuple, Optional
+from typing import Any, List, NamedTuple, Optional
 
 from hermes_cli.providers import (
     determine_api_mode,
@@ -351,6 +351,86 @@ def get_authenticated_provider_slugs(
         return [p["slug"] for p in providers]
     except Exception:
         return []
+
+
+def _normalize_user_provider_slug(value: str) -> str:
+    """Normalize user-configured provider names for menu/display matching."""
+    return (value or "").strip().lower().replace(" ", "-")
+
+
+def _extract_configured_model_ids(entry: dict[str, Any]) -> list[str]:
+    """Extract model IDs from a user-configured provider entry."""
+    model_ids: list[str] = []
+    configured = entry.get("models")
+    if isinstance(configured, list):
+        for item in configured:
+            if isinstance(item, str):
+                model_id = item.strip()
+            elif isinstance(item, dict):
+                model_id = str(item.get("id") or item.get("model") or item.get("name") or "").strip()
+            else:
+                model_id = ""
+            if model_id and model_id not in model_ids:
+                model_ids.append(model_id)
+
+    for key in ("default_model", "model"):
+        model_id = str(entry.get(key) or "").strip()
+        if model_id and model_id not in model_ids:
+            model_ids.append(model_id)
+    return model_ids
+
+
+def _collect_user_defined_providers(user_providers: Any) -> list[dict[str, Any]]:
+    """Return normalized user-configured provider entries from config sources."""
+    collected: list[dict[str, Any]] = []
+    seen_slugs: set[str] = set()
+
+    def _add_provider(slug: str, name: str, entry: dict[str, Any]) -> None:
+        normalized_slug = _normalize_user_provider_slug(slug)
+        if not normalized_slug or normalized_slug in seen_slugs:
+            return
+        collected.append({
+            "slug": normalized_slug,
+            "name": (name or slug or normalized_slug).strip(),
+            "api_url": str(
+                entry.get("api")
+                or entry.get("url")
+                or entry.get("base_url")
+                or ""
+            ).strip(),
+            "models": _extract_configured_model_ids(entry),
+        })
+        seen_slugs.add(normalized_slug)
+
+    def _consume(source: Any) -> None:
+        if isinstance(source, dict):
+            for ep_name, ep_cfg in source.items():
+                if isinstance(ep_cfg, dict):
+                    display_name = str(ep_cfg.get("name", "") or ep_name).strip()
+                    _add_provider(ep_name, display_name, ep_cfg)
+        elif isinstance(source, list):
+            for entry in source:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or "").strip()
+                if not name:
+                    continue
+                _add_provider(name, name, entry)
+
+    _consume(user_providers)
+
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        cfg = {}
+
+    if isinstance(cfg, dict):
+        _consume(cfg.get("providers"))
+        _consume(cfg.get("custom_providers"))
+
+    return collected
 
 
 def _resolve_alias_fallback(
@@ -819,31 +899,24 @@ def list_authenticated_providers(
         })
         seen_slugs.add(pid)
 
-    # --- 3. User-defined endpoints from config ---
-    if user_providers and isinstance(user_providers, dict):
-        for ep_name, ep_cfg in user_providers.items():
-            if not isinstance(ep_cfg, dict):
-                continue
-            display_name = ep_cfg.get("name", "") or ep_name
-            api_url = ep_cfg.get("api", "") or ep_cfg.get("url", "") or ""
-            default_model = ep_cfg.get("default_model", "")
-
-            models_list = []
-            if default_model:
-                models_list.append(default_model)
-
-            # Try to probe /v1/models if URL is set (but don't block on it)
-            # For now just show what we know from config
-            results.append({
-                "slug": ep_name,
-                "name": display_name,
-                "is_current": ep_name == current_provider,
-                "is_user_defined": True,
-                "models": models_list,
-                "total_models": len(models_list) if models_list else 0,
-                "source": "user-config",
-                "api_url": api_url,
-            })
+    # --- 3. User-defined endpoints from config (providers + custom_providers) ---
+    current_provider_norm = _normalize_user_provider_slug(current_provider)
+    for provider_entry in _collect_user_defined_providers(user_providers):
+        slug = provider_entry["slug"]
+        if slug in seen_slugs:
+            continue
+        models_list = provider_entry["models"]
+        results.append({
+            "slug": slug,
+            "name": provider_entry["name"],
+            "is_current": slug == current_provider_norm,
+            "is_user_defined": True,
+            "models": models_list[:max_models] if max_models else [],
+            "total_models": len(models_list),
+            "source": "user-config",
+            "api_url": provider_entry["api_url"],
+        })
+        seen_slugs.add(slug)
 
     # Sort: current provider first, then by model count descending
     results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))

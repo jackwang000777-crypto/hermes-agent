@@ -67,8 +67,20 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         if proxy_url and "proxy" not in transport_kwargs:
             transport_kwargs["proxy"] = proxy_url
         self._primary = httpx.AsyncHTTPTransport(**transport_kwargs)
+
+        # Fallback transports connect to raw IPs, so SSL verification must
+        # target the original hostname (set via ``sni_hostname`` in
+        # ``_rewrite_request_for_ip``) rather than the IP embedded in the URL.
+        # httpx validates the certificate against the URL host, which fails
+        # with CERTIFICATE_VERIFY_FAILED for raw IPs.  Disable verification
+        # for fallback IPs — the IPs are known Telegram Bot API endpoints
+        # (discovered via DNS-over-HTTPS or shipped seed list), SNI still
+        # sends the correct hostname, and the alternative is a total
+        # connectivity loss when the primary path is blocked.
+        fallback_kwargs = dict(transport_kwargs)
+        fallback_kwargs["verify"] = False
         self._fallbacks = {
-            ip: httpx.AsyncHTTPTransport(**transport_kwargs) for ip in self._fallback_ips
+            ip: httpx.AsyncHTTPTransport(**fallback_kwargs) for ip in self._fallback_ips
         }
         self._sticky_ip: Optional[str] = None
         self._sticky_lock = asyncio.Lock()

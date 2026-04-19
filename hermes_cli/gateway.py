@@ -71,20 +71,20 @@ def _get_service_pids() -> set:
         try:
             label = get_launchd_label()
             result = subprocess.run(
-                ["launchctl", "list", label],
+                ["launchctl", "print", f"{_launchd_domain()}/{label}"],
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode == 0:
-                # Output: "PID\tStatus\tLabel" header, then one data line
                 for line in result.stdout.strip().splitlines():
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[2] == label:
-                        try:
-                            pid = int(parts[0])
-                            if pid > 0:
-                                pids.add(pid)
-                        except ValueError:
-                            pass
+                    line = line.strip()
+                    if not line.startswith("pid = "):
+                        continue
+                    try:
+                        pid = int(line.split("=", 1)[1].strip())
+                        if pid > 0:
+                            pids.add(pid)
+                    except ValueError:
+                        pass
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
@@ -988,6 +988,20 @@ def _launchd_domain() -> str:
     return f"gui/{os.getuid()}"
 
 
+def _launchd_target(label: str | None = None) -> str:
+    return f"{_launchd_domain()}/{label or get_launchd_label()}"
+
+
+def _launchd_print_status(label: str | None = None, timeout: int = 10) -> tuple[bool, str]:
+    result = subprocess.run(
+        ["launchctl", "print", _launchd_target(label)],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return result.returncode == 0, result.stdout
+
+
 def generate_launchd_plist() -> str:
     python_path = get_python_path()
     working_dir = str(PROJECT_ROOT)
@@ -1238,14 +1252,7 @@ def launchd_status(deep: bool = False):
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
     try:
-        result = subprocess.run(
-            ["launchctl", "list", label],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        loaded = result.returncode == 0
-        loaded_output = result.stdout
+        loaded, loaded_output = _launchd_print_status(label, timeout=10)
     except subprocess.TimeoutExpired:
         loaded = False
         loaded_output = ""
@@ -1811,11 +1818,8 @@ def _is_service_running() -> bool:
         return False
     elif is_macos() and get_launchd_plist_path().exists():
         try:
-            result = subprocess.run(
-                ["launchctl", "list", get_launchd_label()],
-                capture_output=True, text=True, timeout=10,
-            )
-            return result.returncode == 0
+            loaded, _ = _launchd_print_status(timeout=10)
+            return loaded
         except subprocess.TimeoutExpired:
             return False
     # Check for manual processes
